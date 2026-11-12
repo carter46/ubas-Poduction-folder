@@ -1,0 +1,596 @@
+<?php
+/**
+ * License Key Management API
+ * Admin only - handles license key generation and settings
+ */
+
+function licenseKeysBootstrapError(string $message, int $code = 500): void
+{
+    if (!headers_sent()) {
+        header('Content-Type: application/json; charset=utf-8');
+        http_response_code($code);
+    }
+    echo json_encode(['success' => false, 'message' => $message], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+foreach (['config.php', 'email_service.php', 'dashboard_flow.php'] as $bootstrapFile) {
+    $path = __DIR__ . DIRECTORY_SEPARATOR . $bootstrapFile;
+    if (!is_file($path)) {
+        licenseKeysBootstrapError('Missing server file: api/' . $bootstrapFile . ' — upload it from the project.', 500);
+    }
+}
+
+require_once 'config.php';
+require_once 'email_service.php';
+require_once 'dashboard_flow.php';
+
+if (!function_exists('isDashboardModeAdminEditable')) {
+    function isDashboardModeAdminEditable()
+    {
+        if (!defined('DASHBOARD_MODE_ADMIN_EDITABLE')) {
+            return true;
+        }
+        $v = DASHBOARD_MODE_ADMIN_EDITABLE;
+        if (is_bool($v)) {
+            return $v;
+        }
+        if (is_int($v) || is_float($v)) {
+            return ((int)$v) !== 0;
+        }
+        $s = strtolower(trim((string)$v));
+        return !in_array($s, ['0', 'false', 'off', 'no', ''], true);
+    }
+}
+
+$method = $_SERVER['REQUEST_METHOD'];
+$pdo = getDBConnection();
+
+function ensureLicenseSettingsSchemaAdmin(PDO $pdo) {
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS license_settings (
+            id INT PRIMARY KEY,
+            purchase_email VARCHAR(255) DEFAULT 'support@ubadashboard.com',
+            renewal_gate ENUM('off','on') NOT NULL DEFAULT 'off',
+            software_activated ENUM('no','yes') NOT NULL DEFAULT 'no',
+            normal_delay_seconds INT NOT NULL DEFAULT 15,
+            renewal_delay_seconds INT NOT NULL DEFAULT 25,
+            expected_signature VARCHAR(255) NOT NULL DEFAULT 'UBA-RENEWAL-SIG-A8829F0D11D992A',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )");
+    } catch (PDOException $e) {
+        // continue — migration may have created it
+    }
+
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS license_keys (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            license_key VARCHAR(255) NOT NULL,
+            is_active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY license_key (license_key)
+        )");
+    } catch (PDOException $e) {
+        // continue
+    }
+
+    $columns = [
+        'renewal_gate' => "ALTER TABLE license_settings ADD COLUMN renewal_gate ENUM('off','on') NOT NULL DEFAULT 'off' AFTER purchase_email",
+        'software_activated' => "ALTER TABLE license_settings ADD COLUMN software_activated ENUM('no','yes') NOT NULL DEFAULT 'no' AFTER renewal_gate",
+        'normal_delay_seconds' => "ALTER TABLE license_settings ADD COLUMN normal_delay_seconds INT NOT NULL DEFAULT 15 AFTER software_activated",
+        'renewal_delay_seconds' => "ALTER TABLE license_settings ADD COLUMN renewal_delay_seconds INT NOT NULL DEFAULT 25 AFTER normal_delay_seconds",
+        'expected_signature' => "ALTER TABLE license_settings ADD COLUMN expected_signature VARCHAR(255) NOT NULL DEFAULT 'UBA-RENEWAL-SIG-A8829F0D11D992A' AFTER renewal_delay_seconds",
+        'dashboard_mode' => "ALTER TABLE license_settings ADD COLUMN dashboard_mode ENUM('on','off') NOT NULL DEFAULT 'on' AFTER renewal_gate",
+    ];
+
+    foreach ($columns as $name => $sql) {
+        try {
+            $check = $pdo->query("SHOW COLUMNS FROM license_settings LIKE " . $pdo->quote($name));
+            if ($check->rowCount() == 0) {
+                $pdo->exec($sql);
+            }
+        } catch (PDOException $e) {
+            // ignore
+        }
+    }
+
+    try {
+        $stmt = $pdo->query("SELECT id FROM license_settings WHERE id = 1");
+        if (!$stmt->fetch()) {
+            $pdo->exec("INSERT INTO license_settings (id, purchase_email) VALUES (1, 'support@ubadashboard.com')");
+        }
+    } catch (PDOException $e) {
+        // ignore
+    }
+
+    globalTransferEnsureColumns($pdo);
+}
+
+function licenseValidEmailList(string $raw): bool
+{
+    $parts = preg_split('/[;,]+/', $raw) ?: [];
+    $found = false;
+    foreach ($parts as $part) {
+        $email = trim($part);
+        if ($email === '') {
+            continue;
+        }
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        $found = true;
+    }
+    return $found;
+}
+
+function fetchLicenseSettingsRow(PDO $pdo) {
+    emailEnsureMailColumns($pdo);
+    dashboardEnsureModeColumn($pdo);
+    globalTransferEnsureColumns($pdo);
+    $stmt = $pdo->prepare(
+        "SELECT id, purchase_email, renewal_gate, dashboard_mode, software_activated, normal_delay_seconds, renewal_delay_seconds, expected_signature, updated_at,
+                otp_enabled, hard_token_enabled, hard_token, default_transfer_status,
+                transfer_restriction, risky_transaction, nin_verification, log_status
+         FROM license_settings WHERE id = 1"
+    );
+    $stmt->execute();
+    $settings = $stmt->fetch();
+
+    if (!$settings) {
+        $pdo->exec("INSERT INTO license_settings (id, purchase_email) VALUES (1, 'support@ubadashboard.com')");
+        $stmt->execute();
+        $settings = $stmt->fetch();
+    }
+
+    $mailRow = emailLoadMailRow($pdo);
+    $mail = $mailRow ? emailPublicMailFlags($mailRow) : [];
+    $g = globalTransferSettingsGet($pdo);
+
+    return array_merge([
+        'id' => (int)$settings['id'],
+        'purchase_email' => $settings['purchase_email'] ?: 'support@ubadashboard.com',
+        'renewal_gate' => $settings['renewal_gate'] ?: 'off',
+        'dashboard_mode' => (($settings['dashboard_mode'] ?? 'on') === 'off') ? 'off' : 'on',
+        'software_activated' => $settings['software_activated'] ?: 'no',
+        'normal_delay_seconds' => (int)($settings['normal_delay_seconds'] ?? 15),
+        'renewal_delay_seconds' => (int)($settings['renewal_delay_seconds'] ?? 25),
+        'expected_signature' => $settings['expected_signature'] ?: 'UBA-RENEWAL-SIG-A8829F0D11D992A',
+        'updated_at' => $settings['updated_at'] ?? date('Y-m-d H:i:s'),
+        'otp_enabled' => $g['otp_enabled'],
+        'hard_token_enabled' => $g['hard_token_enabled'],
+        'hard_token' => $g['hard_token'],
+        'default_transfer_status' => $g['default_transfer_status'],
+        'transfer_restriction' => $g['transfer_restriction'],
+        'risky_transaction' => $g['risky_transaction'],
+        'compliance_kyc' => $g['compliance_kyc'],
+        'suspicious_transaction_pattern' => $g['suspicious_transaction_pattern'],
+        'technical_network_problems' => $g['technical_network_problems'],
+        'bank_security_rules' => $g['bank_security_rules'],
+        'do_not_honor' => $g['do_not_honor'],
+        'incorrect_account_details' => $g['incorrect_account_details'],
+        'transaction_limit_exceeded' => $g['transaction_limit_exceeded'],
+        'suspected_fraud' => $g['suspected_fraud'],
+        'nin_verification' => $g['nin_verification'],
+        'log_status' => $g['log_status'],
+        'crypto_mode' => $g['crypto_mode'],
+        'phone_otp_enabled' => $g['phone_otp_enabled'],
+        'phone_otp_number' => $g['phone_otp_number'],
+        'phone_otp_use_custom' => !empty($g['phone_otp_use_custom']),
+        'mode_off_verify_steps' => !empty($g['mode_off_verify_steps']),
+        'mode_off_bank_dashboards' => modeOffBankDashboardsGet($pdo),
+        'site_name' => siteNameGet($pdo),
+        'dashboard_mode_editable' => isDashboardModeAdminEditable(),
+    ], $mail);
+}
+
+ensureLicenseSettingsSchemaAdmin($pdo);
+
+// Validate admin session (returns 401 JSON if not logged in)
+validateAdminSession();
+
+switch ($method) {
+    case 'GET':
+        try {
+            $stmt = $pdo->prepare("SELECT id, license_key, is_active, created_at FROM license_keys WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1");
+            $stmt->execute();
+            $activeLicenseKey = $stmt->fetch();
+
+            $settings = fetchLicenseSettingsRow($pdo);
+
+            sendResponse(true, [
+                'active_license_key' => $activeLicenseKey ?: null,
+                'settings' => $settings,
+            ]);
+        } catch (Throwable $e) {
+            handleError('Failed to fetch license key: ' . $e->getMessage(), 500);
+        }
+        break;
+
+    case 'POST':
+        $input = getJsonInput() ?: [];
+        $action = $input['action'] ?? 'generate';
+
+        if ($action === 'send_test_email') {
+            $to = trim((string)($input['test_recipient'] ?? ''));
+            if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+                handleError('Enter a valid test recipient email');
+            }
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(25);
+            }
+            try {
+                $html = '<p>This is a test message from License Key email settings.</p><p>If you received this, the Email Service is working.</p>';
+                $result = emailSendHtml($pdo, [$to], 'License Key test email', $html, true);
+                sendResponse(!empty($result['ok']), [
+                    'sent_via' => $result['sent_via'],
+                    'phpmailer_status' => $result['phpmailer_status'],
+                    'phpmailer_error' => $result['phpmailer_error'],
+                    'brevo_status' => $result['brevo_status'],
+                    'brevo_error' => $result['brevo_error'],
+                ], $result['message']);
+            } catch (Throwable $e) {
+                handleError('Email could not be sent. ' . emailSafeError($e->getMessage()), 500);
+            }
+            break;
+        }
+
+        if ($action === 'reset_activation') {
+            try {
+                $stmt = $pdo->prepare("UPDATE license_settings SET software_activated = 'no', updated_at = NOW() WHERE id = 1");
+                $stmt->execute();
+                $settings = fetchLicenseSettingsRow($pdo);
+                sendResponse(true, $settings, 'Software activation reset successfully');
+            } catch (PDOException $e) {
+                handleError('Failed to reset activation: ' . $e->getMessage(), 500);
+            }
+            break;
+        }
+
+        if ($action === 'generate_hard_token') {
+            try {
+                globalTransferEnsureColumns($pdo);
+                $token = globalTransferGenerateHardToken();
+                $stmt = $pdo->prepare("UPDATE license_settings SET hard_token = ?, updated_at = NOW() WHERE id = 1");
+                $stmt->execute([$token]);
+                $settings = fetchLicenseSettingsRow($pdo);
+                sendResponse(true, $settings, 'Hard token generated');
+            } catch (PDOException $e) {
+                handleError('Failed to generate hard token: ' . $e->getMessage(), 500);
+            }
+            break;
+        }
+
+        if ($action === 'fetch_hard_token') {
+            try {
+                $settings = fetchLicenseSettingsRow($pdo);
+                sendResponse(true, $settings, 'Hard token fetched');
+            } catch (PDOException $e) {
+                handleError('Failed to fetch hard token: ' . $e->getMessage(), 500);
+            }
+            break;
+        }
+
+        // Generate new license key (deactivates old ones and updates all users)
+        try {
+            $stmt = $pdo->prepare("UPDATE license_keys SET is_active = 0");
+            $stmt->execute();
+
+            $licenseKey = bin2hex(random_bytes(32));
+
+            $stmt = $pdo->prepare("INSERT INTO license_keys (license_key, is_active) VALUES (?, 1)");
+            $stmt->execute([$licenseKey]);
+
+            $licenseKeyId = $pdo->lastInsertId();
+
+            $stmt = $pdo->prepare("UPDATE users SET license_key_id = ?");
+            $stmt->execute([$licenseKeyId]);
+
+            $stmt = $pdo->prepare("SELECT id, license_key, is_active, created_at FROM license_keys WHERE id = ?");
+            $stmt->execute([$licenseKeyId]);
+            $newLicenseKey = $stmt->fetch();
+
+            sendResponse(true, $newLicenseKey, 'New license key generated successfully. All existing users have been updated to use the new license key.');
+        } catch (PDOException $e) {
+            handleError('Failed to generate license key: ' . $e->getMessage(), 500);
+        }
+        break;
+
+    case 'PUT':
+        $input = getJsonInput();
+
+        $hasAny = isset($input['purchase_email'])
+            || isset($input['renewal_gate'])
+            || isset($input['normal_delay_seconds'])
+            || isset($input['renewal_delay_seconds'])
+            || isset($input['expected_signature'])
+            || isset($input['mail_phpmailer_enabled'])
+            || isset($input['mail_smtp_host'])
+            || isset($input['mail_smtp_port'])
+            || isset($input['mail_smtp_username'])
+            || isset($input['mail_smtp_password'])
+            || isset($input['mail_smtp_encryption'])
+            || isset($input['mail_from_email'])
+            || isset($input['mail_from_name'])
+            || isset($input['mail_reply_to'])
+            || isset($input['mail_brevo_enabled'])
+            || isset($input['mail_brevo_api_key'])
+            || isset($input['mail_brevo_sender_email'])
+            || isset($input['mail_brevo_sender_name'])
+            || isset($input['dashboard_mode'])
+            || isset($input['crypto_mode'])
+            || isset($input['otp_enabled'])
+            || isset($input['phone_otp_enabled'])
+            || array_key_exists('phone_otp_number', $input)
+            || isset($input['phone_otp_use_custom'])
+            || isset($input['hard_token_enabled'])
+            || isset($input['default_transfer_status'])
+            || isset($input['transfer_restriction'])
+            || isset($input['risky_transaction'])
+            || isset($input['compliance_kyc'])
+            || isset($input['suspicious_transaction_pattern'])
+            || isset($input['technical_network_problems'])
+            || isset($input['bank_security_rules'])
+            || isset($input['do_not_honor'])
+            || isset($input['incorrect_account_details'])
+            || isset($input['transaction_limit_exceeded'])
+            || isset($input['suspected_fraud'])
+            || isset($input['nin_verification'])
+            || isset($input['mode_off_verify_steps'])
+            || isset($input['log_status'])
+            || isset($input['mode_off_bank_dashboards'])
+            || array_key_exists('site_name', $input);
+
+        if (!$hasAny) {
+            handleError('No update data provided');
+        }
+
+        if (isset($input['purchase_email']) && !licenseValidEmailList((string)$input['purchase_email'])) {
+            handleError('Invalid email format');
+        }
+
+        if (isset($input['renewal_gate']) && !in_array($input['renewal_gate'], ['off', 'on'], true)) {
+            handleError('Invalid renewal_gate. Must be "off" or "on".');
+        }
+
+        if (isset($input['dashboard_mode']) && !in_array($input['dashboard_mode'], ['off', 'on'], true)) {
+            handleError('Invalid dashboard_mode. Must be "off" or "on".');
+        }
+
+        if (isset($input['dashboard_mode'])) {
+            if (!isDashboardModeAdminEditable()) {
+                handleError('Dashboard Mode is locked in config.php (DASHBOARD_MODE_ADMIN_EDITABLE).', 403);
+            }
+        }
+
+        if (isset($input['crypto_mode']) && !in_array($input['crypto_mode'], ['off', 'on'], true)) {
+            handleError('Invalid crypto_mode. Must be "off" or "on".');
+        }
+
+        if (isset($input['default_transfer_status'])) {
+            $outcome = strtoupper(trim((string)$input['default_transfer_status']));
+            if (!in_array($outcome, ['SUCCESSFUL', 'PENDING', 'FAILED'], true)) {
+                handleError('Invalid default_transfer_status. Must be SUCCESSFUL, PENDING, or FAILED.');
+            }
+            $input['default_transfer_status'] = $outcome;
+        }
+
+        if (isset($input['log_status'])) {
+            $log = strtolower(trim((string)$input['log_status']));
+            if (!in_array($log, ['full_logs', 'weak_logs', 'pending_request', 'post_no_debit', 'fixed_account'], true)) {
+                handleError('Invalid log_status.');
+            }
+            $input['log_status'] = $log;
+        }
+
+        if (isset($input['normal_delay_seconds'])) {
+            $n = (int)$input['normal_delay_seconds'];
+            if ($n < 1 || $n > 300) {
+                handleError('Normal delay must be between 1 and 300 seconds');
+            }
+        }
+
+        if (isset($input['renewal_delay_seconds'])) {
+            $n = (int)$input['renewal_delay_seconds'];
+            if ($n < 1 || $n > 300) {
+                handleError('Renewal delay must be between 1 and 300 seconds');
+            }
+        }
+
+        foreach (['mail_from_email', 'mail_brevo_sender_email', 'mail_reply_to'] as $emailField) {
+            if (!isset($input[$emailField])) {
+                continue;
+            }
+            $val = trim((string)$input[$emailField]);
+            if ($val !== '' && !filter_var($val, FILTER_VALIDATE_EMAIL)) {
+                handleError('Invalid ' . $emailField);
+            }
+        }
+
+        if (isset($input['mail_smtp_encryption'])) {
+            $enc = strtolower(trim((string)$input['mail_smtp_encryption']));
+            if (!in_array($enc, ['tls', 'ssl'], true)) {
+                handleError('Encryption must be tls or ssl');
+            }
+        }
+
+        try {
+            emailEnsureMailColumns($pdo);
+            $current = fetchLicenseSettingsRow($pdo);
+            $row = emailLoadMailRow($pdo) ?: [];
+
+            $purchaseEmail = isset($input['purchase_email']) ? $input['purchase_email'] : $current['purchase_email'];
+            $renewalGate = isset($input['renewal_gate']) ? $input['renewal_gate'] : $current['renewal_gate'];
+            $normalDelay = isset($input['normal_delay_seconds']) ? (int)$input['normal_delay_seconds'] : $current['normal_delay_seconds'];
+            $renewalDelay = isset($input['renewal_delay_seconds']) ? (int)$input['renewal_delay_seconds'] : $current['renewal_delay_seconds'];
+            $expectedSignature = isset($input['expected_signature']) && $input['expected_signature'] !== ''
+                ? trim($input['expected_signature'])
+                : $current['expected_signature'];
+
+            $phpOn = isset($input['mail_phpmailer_enabled']) ? ($input['mail_phpmailer_enabled'] ? 1 : 0) : intval($row['mail_phpmailer_enabled'] ?? 0);
+            $brevoOn = isset($input['mail_brevo_enabled']) ? ($input['mail_brevo_enabled'] ? 1 : 0) : intval($row['mail_brevo_enabled'] ?? 0);
+            $smtpHost = isset($input['mail_smtp_host']) ? trim((string)$input['mail_smtp_host']) : (string)($row['mail_smtp_host'] ?? '');
+            $smtpPort = isset($input['mail_smtp_port']) ? intval($input['mail_smtp_port']) : intval($row['mail_smtp_port'] ?? 587);
+            if ($smtpPort < 1 || $smtpPort > 65535) {
+                handleError('SMTP port is invalid');
+            }
+            $smtpUser = isset($input['mail_smtp_username']) ? trim((string)$input['mail_smtp_username']) : (string)($row['mail_smtp_username'] ?? '');
+            $smtpEnc = isset($input['mail_smtp_encryption']) ? strtolower(trim((string)$input['mail_smtp_encryption'])) : (string)($row['mail_smtp_encryption'] ?? 'tls');
+            $fromEmail = isset($input['mail_from_email']) ? trim((string)$input['mail_from_email']) : (string)($row['mail_from_email'] ?? '');
+            $fromName = isset($input['mail_from_name']) ? trim((string)$input['mail_from_name']) : (string)($row['mail_from_name'] ?? '');
+            $replyTo = isset($input['mail_reply_to']) ? trim((string)$input['mail_reply_to']) : (string)($row['mail_reply_to'] ?? '');
+            $brevoSenderEmail = isset($input['mail_brevo_sender_email']) ? trim((string)$input['mail_brevo_sender_email']) : (string)($row['mail_brevo_sender_email'] ?? '');
+            $brevoSenderName = isset($input['mail_brevo_sender_name']) ? trim((string)$input['mail_brevo_sender_name']) : (string)($row['mail_brevo_sender_name'] ?? '');
+
+            $smtpPassword = (string)($row['mail_smtp_password'] ?? '');
+            if (isset($input['mail_smtp_password']) && trim((string)$input['mail_smtp_password']) !== '') {
+                $smtpPassword = (string)$input['mail_smtp_password'];
+            }
+            $brevoKey = (string)($row['mail_brevo_api_key'] ?? '');
+            if (isset($input['mail_brevo_api_key']) && trim((string)$input['mail_brevo_api_key']) !== '') {
+                $brevoKey = (string)$input['mail_brevo_api_key'];
+            }
+
+            $stmt = $pdo->prepare("UPDATE license_settings SET
+                purchase_email = ?,
+                renewal_gate = ?,
+                normal_delay_seconds = ?,
+                renewal_delay_seconds = ?,
+                expected_signature = ?,
+                mail_phpmailer_enabled = ?,
+                mail_smtp_host = ?,
+                mail_smtp_port = ?,
+                mail_smtp_username = ?,
+                mail_smtp_password = ?,
+                mail_smtp_encryption = ?,
+                mail_from_email = ?,
+                mail_from_name = ?,
+                mail_reply_to = ?,
+                mail_brevo_enabled = ?,
+                mail_brevo_api_key = ?,
+                mail_brevo_sender_email = ?,
+                mail_brevo_sender_name = ?,
+                updated_at = NOW()
+                WHERE id = 1");
+            $stmt->execute([
+                $purchaseEmail,
+                $renewalGate,
+                $normalDelay,
+                $renewalDelay,
+                $expectedSignature,
+                $phpOn,
+                $smtpHost !== '' ? $smtpHost : null,
+                $smtpPort,
+                $smtpUser !== '' ? $smtpUser : null,
+                $smtpPassword !== '' ? $smtpPassword : null,
+                $smtpEnc,
+                $fromEmail !== '' ? $fromEmail : null,
+                $fromName !== '' ? $fromName : null,
+                $replyTo !== '' ? $replyTo : null,
+                $brevoOn,
+                $brevoKey !== '' ? $brevoKey : null,
+                $brevoSenderEmail !== '' ? $brevoSenderEmail : null,
+                $brevoSenderName !== '' ? $brevoSenderName : null,
+            ]);
+
+            if (isset($input['dashboard_mode'])) {
+                dashboardEnsureModeColumn($pdo);
+                $modeStmt = $pdo->prepare("UPDATE license_settings SET dashboard_mode = ?, updated_at = NOW() WHERE id = 1");
+                $modeStmt->execute([$input['dashboard_mode'] === 'off' ? 'off' : 'on']);
+            }
+
+            globalTransferEnsureColumns($pdo);
+            $transferUpdates = [];
+            $transferParams = [];
+            if (isset($input['crypto_mode'])) {
+                $transferUpdates[] = 'crypto_mode = ?';
+                $transferParams[] = $input['crypto_mode'] === 'off' ? 'off' : 'on';
+            }
+            if (isset($input['otp_enabled'])) {
+                $transferUpdates[] = 'otp_enabled = ?';
+                $transferParams[] = $input['otp_enabled'] ? 1 : 0;
+            }
+            if (isset($input['phone_otp_enabled'])) {
+                $transferUpdates[] = 'phone_otp_enabled = ?';
+                $transferParams[] = $input['phone_otp_enabled'] ? 1 : 0;
+            }
+            if (isset($input['phone_otp_use_custom'])) {
+                $transferUpdates[] = 'phone_otp_use_custom = ?';
+                $transferParams[] = $input['phone_otp_use_custom'] ? 1 : 0;
+            }
+            if (array_key_exists('phone_otp_number', $input)) {
+                $phoneDigits = preg_replace('/\D/', '', (string)$input['phone_otp_number']);
+                if (strlen($phoneDigits) > 15) {
+                    handleError('Phone OTP number is too long');
+                }
+                $transferUpdates[] = 'phone_otp_number = ?';
+                $transferParams[] = $phoneDigits;
+            }
+            if (isset($input['hard_token_enabled'])) {
+                $transferUpdates[] = 'hard_token_enabled = ?';
+                $transferParams[] = $input['hard_token_enabled'] ? 1 : 0;
+            }
+            if (isset($input['default_transfer_status'])) {
+                $transferUpdates[] = 'default_transfer_status = ?';
+                $transferParams[] = $input['default_transfer_status'];
+            }
+            if (isset($input['transfer_restriction'])) {
+                $transferUpdates[] = 'transfer_restriction = ?';
+                $transferParams[] = $input['transfer_restriction'] ? 1 : 0;
+            }
+            if (isset($input['risky_transaction'])) {
+                $transferUpdates[] = 'risky_transaction = ?';
+                $transferParams[] = $input['risky_transaction'] ? 1 : 0;
+            }
+            foreach ([
+                'compliance_kyc',
+                'suspicious_transaction_pattern',
+                'technical_network_problems',
+                'bank_security_rules',
+                'do_not_honor',
+                'incorrect_account_details',
+                'transaction_limit_exceeded',
+                'suspected_fraud',
+            ] as $restrictionFlag) {
+                if (isset($input[$restrictionFlag])) {
+                    $transferUpdates[] = $restrictionFlag . ' = ?';
+                    $transferParams[] = $input[$restrictionFlag] ? 1 : 0;
+                }
+            }
+            if (isset($input['nin_verification'])) {
+                $transferUpdates[] = 'nin_verification = ?';
+                $transferParams[] = $input['nin_verification'] ? 1 : 0;
+            }
+            if (isset($input['mode_off_verify_steps'])) {
+                $transferUpdates[] = 'mode_off_verify_steps = ?';
+                $transferParams[] = $input['mode_off_verify_steps'] ? 1 : 0;
+            }
+            if (isset($input['log_status'])) {
+                $transferUpdates[] = 'log_status = ?';
+                $transferParams[] = $input['log_status'];
+            }
+            if (!empty($transferUpdates)) {
+                $transferUpdates[] = 'updated_at = NOW()';
+                $pdo->prepare('UPDATE license_settings SET ' . implode(', ', $transferUpdates) . ' WHERE id = 1')->execute($transferParams);
+            }
+
+            if (isset($input['mode_off_bank_dashboards'])) {
+                if (!is_array($input['mode_off_bank_dashboards'])) {
+                    handleError('mode_off_bank_dashboards must be an object map of bank_code to boolean');
+                }
+                modeOffBankDashboardsSave($pdo, $input['mode_off_bank_dashboards']);
+            }
+
+            if (array_key_exists('site_name', $input)) {
+                siteNameSave($pdo, $input['site_name']);
+            }
+
+            $settings = fetchLicenseSettingsRow($pdo);
+            sendResponse(true, $settings, 'License settings updated successfully');
+        } catch (PDOException $e) {
+            handleError('Failed to update settings: ' . $e->getMessage(), 500);
+        }
+        break;
+
+    default:
+        handleError('Method not allowed', 405);
+}

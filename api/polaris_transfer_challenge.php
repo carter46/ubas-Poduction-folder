@@ -1,0 +1,309 @@
+<?php
+/**
+ * Polar transfer OTP challenge. Bound to a specific transfer attempt.
+ */
+require_once 'config.php';
+require_once 'polaris_stanbic_schema.php';
+require_once 'polaris_transfer_helpers.php';
+require_once 'dashboard_flow.php';
+
+$method = $_SERVER['REQUEST_METHOD'];
+if ($method !== 'POST') {
+    handleError('Method not allowed', 405);
+}
+
+$pdo = getDBConnection();
+ensurePolarisStanbicSchema($pdo);
+
+$input = getJsonInput() ?: [];
+$action = strtolower(trim((string)($input['action'] ?? 'send')));
+
+$account = polarisAccountRow($pdo);
+if (!$account) {
+    handleError('Polaris account not configured', 500);
+}
+
+if ($action === 'verify_token') {
+    $global = globalTransferSettingsGet($pdo);
+    $tokenEnabled = !empty($global['hard_token_enabled']);
+    if (!$tokenEnabled) {
+        sendResponse(true, ['verified' => true], 'Hard token not required');
+    }
+    $posted = trim((string)($input['hard_token'] ?? ''));
+    $stored = trim((string)($global['hard_token'] ?? ''));
+    if ($stored === '' || $posted === '' || !hash_equals($stored, $posted)) {
+        handleError('Hard token is incorrect');
+    }
+    sendResponse(true, ['verified' => true], 'Hard token verified');
+}
+
+$global = globalTransferSettingsGet($pdo);
+
+if ($action === 'send_phone') {
+    if (empty($global['phone_otp_enabled'])) {
+        handleError('Phone OTP is not enabled');
+    }
+
+    $otp = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+    $expires = date('Y-m-d H:i:s', time() + 600);
+    $hash = password_hash($otp, PASSWORD_DEFAULT);
+
+    $pdo->prepare(
+        "UPDATE polaris_bank_account_settings
+         SET phone_otp_verified = 0, phone_otp_hash = ?, phone_otp_expires_at = ?, updated_at = NOW()
+         WHERE id = ?"
+    )->execute([$hash, $expires, $account['id']]);
+
+    $clearPhoneOtp = function () use ($pdo, $account) {
+        $pdo->prepare(
+            "UPDATE polaris_bank_account_settings
+             SET phone_otp_hash = NULL, phone_otp_expires_at = NULL, phone_otp_verified = 0, updated_at = NOW()
+             WHERE id = ?"
+        )->execute([$account['id']]);
+    };
+
+    $emails = polarisPurchaseEmails($pdo);
+    if (empty($emails)) {
+        $clearPhoneOtp();
+        handleError('Purchase email is not configured');
+    }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $html = polarisOtpEmailHtml($otp, polarisLogoSrc(), 'Phone Verification');
+    $sent = polarisSendHtmlMail($pdo, $emails, 'Polaris Phone Verification', $html);
+    $via = $sent['sent_via'] ?? null;
+    if (empty($sent['ok']) || ($via !== 'phpmailer' && $via !== 'brevo')) {
+        $clearPhoneOtp();
+        $msg = trim((string)($sent['message'] ?? ''));
+        handleError($msg !== '' ? $msg : 'Could not send Phone OTP email. Check email configuration.');
+    }
+
+    sendResponse(true, [
+        'ok' => true,
+        'expires_in' => 600,
+        'sent_via' => $via,
+    ], 'Phone OTP sent');
+}
+
+if ($action === 'verify_phone') {
+    if (empty($global['phone_otp_enabled'])) {
+        sendResponse(true, ['verified' => true], 'Phone OTP not required');
+    }
+    $otp = preg_replace('/\D/', '', (string)($input['otp'] ?? ''));
+    if (!is_string($otp) || strlen($otp) !== 6) {
+        handleError('Invalid OTP');
+    }
+
+    $stmt = $pdo->prepare("SELECT phone_otp_hash, phone_otp_expires_at FROM polaris_bank_account_settings WHERE id = ? LIMIT 1");
+    $stmt->execute([$account['id']]);
+    $row = $stmt->fetch();
+    if (!$row) {
+        handleError('Polaris account not configured', 500);
+    }
+
+    $storedHash = (string)($row['phone_otp_hash'] ?? '');
+    $expiresAt = (string)($row['phone_otp_expires_at'] ?? '');
+    if ($storedHash === '' || $expiresAt === '' || strtotime($expiresAt) < time()) {
+        handleError('OTP has expired');
+    }
+    if (!password_verify($otp, $storedHash)) {
+        handleError('Incorrect OTP');
+    }
+
+    $pdo->prepare(
+        "UPDATE polaris_bank_account_settings
+         SET phone_otp_verified = 1, phone_otp_hash = NULL, phone_otp_expires_at = NULL, updated_at = NOW()
+         WHERE id = ?"
+    )->execute([$account['id']]);
+    sendResponse(true, ['verified' => true], 'Phone OTP verified');
+}
+
+$otpEnabled = !empty($global['otp_enabled']);
+if (!$otpEnabled) {
+    handleError('OTP is not enabled');
+}
+
+$preIntentHash = polarisPreTransferIntentHash();
+
+if ($action === 'send_pre_transfer') {
+    $otp = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+    $challengeId = bin2hex(random_bytes(16));
+    $expires = date('Y-m-d H:i:s', time() + 600);
+    $hash = password_hash($otp, PASSWORD_DEFAULT);
+
+    $stmt = $pdo->prepare(
+        "UPDATE polaris_bank_account_settings
+         SET otp_hash = ?, otp_expires_at = ?, otp_challenge_id = ?, otp_intent_hash = ?, otp_verified = 0, phone_otp_verified = 0, phone_otp_hash = NULL, phone_otp_expires_at = NULL, updated_at = NOW()
+         WHERE id = ?"
+    );
+    $stmt->execute([$hash, $expires, $challengeId, $preIntentHash, $account['id']]);
+
+    $clearOtp = function () use ($pdo, $account) {
+        $clear = $pdo->prepare(
+            "UPDATE polaris_bank_account_settings
+             SET otp_hash = NULL, otp_expires_at = NULL, otp_challenge_id = NULL, otp_intent_hash = NULL, otp_verified = 0, updated_at = NOW()
+             WHERE id = ?"
+        );
+        $clear->execute([$account['id']]);
+    };
+
+    $emails = polarisPurchaseEmails($pdo);
+    if (empty($emails)) {
+        $clearOtp();
+        handleError('Purchase email is not configured');
+    }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $html = polarisOtpEmailHtml($otp, polarisLogoSrc());
+    $sent = polarisSendHtmlMail($pdo, $emails, 'Polaris Account Verification', $html, $challengeId);
+    $via = $sent['sent_via'] ?? null;
+    if (empty($sent['ok']) || ($via !== 'phpmailer' && $via !== 'brevo')) {
+        $clearOtp();
+        $msg = trim((string)($sent['message'] ?? ''));
+        handleError($msg !== '' ? $msg : 'Could not send OTP email. Check email configuration.');
+    }
+
+    sendResponse(true, [
+        'challenge_id' => $challengeId,
+        'expires_in' => 600,
+        'sent_via' => $via,
+        'phpmailer_status' => $sent['phpmailer_status'] ?? '',
+        'phpmailer_error' => $sent['phpmailer_error'] ?? '',
+        'brevo_status' => $sent['brevo_status'] ?? '',
+        'brevo_error' => $sent['brevo_error'] ?? '',
+    ], 'OTP sent');
+}
+
+if ($action === 'verify_pre_transfer') {
+    $challengeId = trim((string)($input['challenge_id'] ?? ''));
+    $otp = preg_replace('/\D/', '', (string)($input['otp'] ?? ''));
+    if ($challengeId === '' || strlen($otp) !== 6) {
+        handleError('Invalid OTP');
+    }
+
+    $stmt = $pdo->prepare("SELECT * FROM polaris_bank_account_settings WHERE id = ? LIMIT 1");
+    $stmt->execute([$account['id']]);
+    $row = $stmt->fetch();
+    if (!$row) {
+        handleError('Polaris account not configured', 500);
+    }
+
+    $storedChallenge = (string)($row['otp_challenge_id'] ?? '');
+    $storedIntent = (string)($row['otp_intent_hash'] ?? '');
+    $storedHash = (string)($row['otp_hash'] ?? '');
+    $expiresAt = (string)($row['otp_expires_at'] ?? '');
+
+    if ($storedChallenge === '' || !hash_equals($storedChallenge, $challengeId) || !hash_equals($storedIntent, $preIntentHash)) {
+        handleError('OTP does not match this verification');
+    }
+    if ($expiresAt === '' || strtotime($expiresAt) < time()) {
+        handleError('OTP has expired');
+    }
+    if ($storedHash === '' || !password_verify($otp, $storedHash)) {
+        handleError('Incorrect OTP');
+    }
+
+    $upd = $pdo->prepare("UPDATE polaris_bank_account_settings SET otp_verified = 1, updated_at = NOW() WHERE id = ?");
+    $upd->execute([$account['id']]);
+
+    sendResponse(true, ['challenge_id' => $challengeId, 'verified' => true], 'OTP verified');
+}
+
+$transferType = strtolower(trim((string)($input['transfer_type'] ?? '')));
+$destination = trim((string)($input['destination'] ?? ''));
+$amount = trim((string)($input['amount'] ?? ''));
+if (!in_array($transferType, ['bank', 'crypto'], true) || $destination === '' || !is_numeric($amount) || floatval($amount) <= 0) {
+    handleError('Invalid transfer attempt details');
+}
+$intentHash = polarisIntentHash($transferType, $destination, $amount);
+
+if ($action === 'send') {
+    $otp = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+    $challengeId = bin2hex(random_bytes(16));
+    $expires = date('Y-m-d H:i:s', time() + 600);
+    $hash = password_hash($otp, PASSWORD_DEFAULT);
+
+    $stmt = $pdo->prepare(
+        "UPDATE polaris_bank_account_settings
+         SET otp_hash = ?, otp_expires_at = ?, otp_challenge_id = ?, otp_intent_hash = ?, otp_verified = 0, phone_otp_verified = 0, phone_otp_hash = NULL, phone_otp_expires_at = NULL, updated_at = NOW()
+         WHERE id = ?"
+    );
+    $stmt->execute([$hash, $expires, $challengeId, $intentHash, $account['id']]);
+    error_log('otp_mail challenge=' . $challengeId . ' event=saved');
+
+    $clearOtp = function () use ($pdo, $account) {
+        $clear = $pdo->prepare(
+            "UPDATE polaris_bank_account_settings
+             SET otp_hash = NULL, otp_expires_at = NULL, otp_challenge_id = NULL, otp_intent_hash = NULL, otp_verified = 0, updated_at = NOW()
+             WHERE id = ?"
+        );
+        $clear->execute([$account['id']]);
+    };
+
+    $emails = polarisPurchaseEmails($pdo);
+    if (empty($emails)) {
+        $clearOtp();
+        handleError('Purchase email is not configured');
+    }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $html = polarisOtpEmailHtml($otp, polarisLogoSrc());
+    error_log('otp_mail challenge=' . $challengeId . ' event=email_service_called');
+    $sent = polarisSendHtmlMail($pdo, $emails, 'Polaris Transfer Authorization', $html, $challengeId);
+    $via = $sent['sent_via'] ?? null;
+    if (empty($sent['ok']) || ($via !== 'phpmailer' && $via !== 'brevo')) {
+        $clearOtp();
+        $msg = trim((string)($sent['message'] ?? ''));
+        handleError($msg !== '' ? $msg : 'Could not send OTP email. Check email configuration.');
+    }
+
+    sendResponse(true, [
+        'challenge_id' => $challengeId,
+        'expires_in' => 600,
+        'sent_via' => $via,
+        'phpmailer_status' => $sent['phpmailer_status'] ?? '',
+        'phpmailer_error' => $sent['phpmailer_error'] ?? '',
+        'brevo_status' => $sent['brevo_status'] ?? '',
+        'brevo_error' => $sent['brevo_error'] ?? '',
+    ], 'OTP sent');
+}
+
+if ($action === 'verify') {
+    $challengeId = trim((string)($input['challenge_id'] ?? ''));
+    $otp = preg_replace('/\D/', '', (string)($input['otp'] ?? ''));
+    if ($challengeId === '' || strlen($otp) !== 6) {
+        handleError('Invalid OTP');
+    }
+
+    $stmt = $pdo->prepare("SELECT * FROM polaris_bank_account_settings WHERE id = ? LIMIT 1");
+    $stmt->execute([$account['id']]);
+    $row = $stmt->fetch();
+    if (!$row) {
+        handleError('Polaris account not configured', 500);
+    }
+
+    $storedChallenge = (string)($row['otp_challenge_id'] ?? '');
+    $storedIntent = (string)($row['otp_intent_hash'] ?? '');
+    $storedHash = (string)($row['otp_hash'] ?? '');
+    $expiresAt = (string)($row['otp_expires_at'] ?? '');
+
+    if ($storedChallenge === '' || !hash_equals($storedChallenge, $challengeId) || !hash_equals($storedIntent, $intentHash)) {
+        handleError('OTP does not match this transfer attempt');
+    }
+    if ($expiresAt === '' || strtotime($expiresAt) < time()) {
+        handleError('OTP has expired');
+    }
+    if ($storedHash === '' || !password_verify($otp, $storedHash)) {
+        handleError('Incorrect OTP');
+    }
+
+    $upd = $pdo->prepare("UPDATE polaris_bank_account_settings SET otp_verified = 1, updated_at = NOW() WHERE id = ?");
+    $upd->execute([$account['id']]);
+
+    sendResponse(true, ['challenge_id' => $challengeId, 'verified' => true], 'OTP verified');
+}
+
+handleError('Unknown action');
